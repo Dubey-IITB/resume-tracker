@@ -1,0 +1,1 @@
+This is a sample resume for John Doe. Experience: 5 years in software development. Skills: Python, FastAPI

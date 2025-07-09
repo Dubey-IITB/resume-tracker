@@ -1,0 +1,1 @@
+This is a sample resume for Jane Smith. Experience: 3 years in web development. Skills: JavaScript, React

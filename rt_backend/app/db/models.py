@@ -20,6 +20,7 @@ class CandidateJobMatch(Base):
     salary_analysis = Column(Text)
     recommendation = Column(Text)
     comparative_analysis = Column(Text)
+    status = Column(String, default="active")  # active, saved, rejected
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     candidate = relationship("Candidate", back_populates="job_matches")

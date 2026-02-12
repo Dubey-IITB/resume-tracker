@@ -129,9 +129,21 @@ def test_candidates():
     return {"message": "Candidates route is working"}
 
 @router.get("/candidates")
-def get_candidates():
-    # Placeholder for actual logic to fetch candidates
-    return {"candidates": [{"id": 1, "name": "John Doe"}, {"id": 2, "name": "Jane Smith"}]}
+def get_candidates(db: Session = Depends(get_db)):
+    """Fetch all candidates from the database."""
+    candidates = db.query(models.Candidate).all()
+    return [
+        {
+            "email": c.email,
+            "name": c.name,
+            "current_ctc": c.current_ctc,
+            "expected_ctc": c.expected_ctc,
+            "resume_path": c.resume_path,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+        for c in candidates
+    ]
 
 @router.post("/rank")
 async def rank_resume(job_description: str, resume1: UploadFile = File(...), resume2: UploadFile = File(...)):
@@ -1095,3 +1107,263 @@ async def extract_email_ollama(resume: UploadFile = File(...)):
             status_code=500,
             detail=f"Error extracting email: {str(e)}"
         )
+
+
+# ==================== RANKING ENDPOINTS ====================
+
+class StatusUpdate(BaseModel):
+    status: str  # "active", "saved", "rejected"
+
+
+@router.post("/rank-by-job/{job_id}")
+async def rank_by_job(job_id: int, db: Session = Depends(get_db)):
+    """
+    Rank ALL candidates against a specific job using Ollama.
+    Computes both JD match scores and comparative rankings.
+    """
+    try:
+        # Get the job
+        job = db.query(models.Job).filter(models.Job.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        # Get all candidates
+        candidates = db.query(models.Candidate).all()
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No candidates found")
+
+        # Prepare job info
+        job_info = {
+            "id": job.id,
+            "title": job.title or "",
+            "jd_text": job.description or job.jd_text or "",
+            "min_budget": job.min_budget or 0,
+            "max_budget": job.max_budget or 0,
+        }
+
+        # Initialize Ollama client
+        ollama_client = OllamaClient()
+
+        # --- Step 1: Get individual JD match scores ---
+        jd_scores = {}
+        for candidate in candidates:
+            candidate_info = {
+                "name": candidate.name,
+                "resume_text": candidate.resume_text or "",
+                "current_ctc": candidate.current_ctc or 0,
+                "expected_ctc": candidate.expected_ctc or 0,
+            }
+            score = ollama_client.compare_candidate_with_jd(candidate_info, job_info)
+            jd_scores[candidate.email] = score
+            logger.info(f"JD match score for {candidate.email}: {score}")
+
+        # --- Step 2: Get comparative scores ---
+        candidates_info_for_compare = []
+        for candidate in candidates:
+            candidates_info_for_compare.append({
+                "id": hash(candidate.email) % 10000,  # numeric id for prompt
+                "name": candidate.name,
+                "resume_text": candidate.resume_text or "",
+                "current_ctc": candidate.current_ctc or 0,
+                "expected_ctc": candidate.expected_ctc or 0,
+            })
+
+        # Map numeric ids back to emails
+        id_to_email = {}
+        for i, candidate in enumerate(candidates):
+            id_to_email[hash(candidate.email) % 10000] = candidate.email
+
+        comparative_scores_raw = ollama_client.compare_candidates(candidates_info_for_compare, job_info)
+        comparative_scores = {}
+        for k, v in comparative_scores_raw.items():
+            email = id_to_email.get(int(k), None)
+            if email:
+                comparative_scores[email] = v
+
+        # --- Step 3: Build results and store in DB ---
+        # Delete old matches for this job first
+        db.query(models.CandidateJobMatch).filter(
+            models.CandidateJobMatch.job_id == job_id
+        ).delete()
+
+        results = []
+        for candidate in candidates:
+            jd_score = jd_scores.get(candidate.email, 0.5)
+            comp_score = comparative_scores.get(candidate.email, 0.5)
+
+            # Salary match
+            budget = job.max_budget or 1
+            salary_ratio = (candidate.expected_ctc or 0) / budget if budget > 0 else 0
+            salary_match = max(0.0, min(1.0, 1.0 - abs(1.0 - salary_ratio)))
+
+            # Overall = 40% JD match + 30% comparative + 30% salary
+            overall = (jd_score * 0.4) + (comp_score * 0.3) + (salary_match * 0.3)
+
+            # Budget fit
+            expected = candidate.expected_ctc or 0
+            if expected <= budget:
+                budget_fit = "Within budget"
+            elif expected <= budget * 1.1:
+                budget_fit = "Slightly above"
+            else:
+                budget_fit = "Above budget"
+
+            salary_gap = round(((expected / budget) - 1) * 100, 2) if budget > 0 else 0
+
+            strengths = ["Technical skills match"] if jd_score >= 0.6 else ["Potential growth candidate"]
+            if salary_match >= 0.8:
+                strengths.append("Good salary fit")
+            weaknesses = []
+            if jd_score < 0.5:
+                weaknesses.append("JD skills mismatch")
+            if salary_match < 0.5:
+                weaknesses.append("Budget constraints")
+            if not weaknesses:
+                weaknesses.append("None identified")
+
+            match_record = models.CandidateJobMatch(
+                candidate_email=candidate.email,
+                job_id=job_id,
+                jd_match_score=round(jd_score, 3),
+                comparative_score=round(comp_score, 3),
+                overall_score=round(overall, 3),
+                salary_match_score=round(salary_match, 3),
+                technical_match_score=round(jd_score, 3),
+                experience_match_score=round(comp_score, 3),
+                strengths=json.dumps(strengths),
+                weaknesses=json.dumps(weaknesses),
+                salary_analysis=json.dumps({
+                    "current_ctc": candidate.current_ctc,
+                    "expected_ctc": candidate.expected_ctc,
+                    "budget_fit": budget_fit,
+                    "salary_gap_percentage": salary_gap,
+                }),
+                recommendation=f"{round(jd_score * 100)}% JD match, {round(comp_score * 100)}% comparative",
+                status="active",
+            )
+            db.add(match_record)
+
+            results.append({
+                "candidate_email": candidate.email,
+                "candidate_name": candidate.name,
+                "current_ctc": candidate.current_ctc,
+                "expected_ctc": candidate.expected_ctc,
+                "jd_match_score": round(jd_score, 3),
+                "comparative_score": round(comp_score, 3),
+                "overall_score": round(overall, 3),
+                "salary_match_score": round(salary_match, 3),
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "budget_fit": budget_fit,
+                "salary_gap_percentage": salary_gap,
+                "recommendation": match_record.recommendation,
+                "status": "active",
+            })
+
+        db.commit()
+
+        # Sort by overall score descending
+        results.sort(key=lambda x: x["overall_score"], reverse=True)
+
+        return {
+            "job_id": job_id,
+            "job_title": job.title,
+            "total_candidates": len(results),
+            "rankings": results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in rank_by_job: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/rankings/{job_id}")
+async def get_rankings(job_id: int, db: Session = Depends(get_db)):
+    """Get cached ranking results for a job (no re-ranking)."""
+    try:
+        job = db.query(models.Job).filter(models.Job.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        matches = (
+            db.query(models.CandidateJobMatch)
+            .filter(models.CandidateJobMatch.job_id == job_id)
+            .all()
+        )
+
+        if not matches:
+            return {
+                "job_id": job_id,
+                "job_title": job.title,
+                "total_candidates": 0,
+                "rankings": [],
+            }
+
+        results = []
+        for m in matches:
+            candidate = db.query(models.Candidate).filter(
+                models.Candidate.email == m.candidate_email
+            ).first()
+
+            results.append({
+                "candidate_email": m.candidate_email,
+                "candidate_name": candidate.name if candidate else m.candidate_email,
+                "current_ctc": candidate.current_ctc if candidate else 0,
+                "expected_ctc": candidate.expected_ctc if candidate else 0,
+                "jd_match_score": m.jd_match_score or 0,
+                "comparative_score": m.comparative_score or 0,
+                "overall_score": m.overall_score or 0,
+                "salary_match_score": m.salary_match_score or 0,
+                "strengths": json.loads(m.strengths) if m.strengths else [],
+                "weaknesses": json.loads(m.weaknesses) if m.weaknesses else [],
+                "budget_fit": json.loads(m.salary_analysis).get("budget_fit", "Unknown") if m.salary_analysis else "Unknown",
+                "salary_gap_percentage": json.loads(m.salary_analysis).get("salary_gap_percentage", 0) if m.salary_analysis else 0,
+                "recommendation": m.recommendation or "",
+                "status": m.status or "active",
+            })
+
+        results.sort(key=lambda x: x["overall_score"], reverse=True)
+
+        return {
+            "job_id": job_id,
+            "job_title": job.title,
+            "total_candidates": len(results),
+            "rankings": results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_rankings: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/candidate-match/{candidate_email}/{job_id}/status")
+async def update_match_status(
+    candidate_email: str,
+    job_id: int,
+    body: StatusUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update candidate-job match status to active/saved/rejected."""
+    if body.status not in ("active", "saved", "rejected"):
+        raise HTTPException(status_code=400, detail="Status must be active, saved, or rejected")
+
+    match = (
+        db.query(models.CandidateJobMatch)
+        .filter(
+            models.CandidateJobMatch.candidate_email == candidate_email,
+            models.CandidateJobMatch.job_id == job_id,
+        )
+        .first()
+    )
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    match.status = body.status
+    db.commit()
+
+    return {"status": "success", "candidate_email": candidate_email, "job_id": job_id, "new_status": body.status}

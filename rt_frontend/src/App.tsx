@@ -6,6 +6,7 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Candidates from './pages/Candidates'
 import Jobs from './pages/Jobs'
+import Rankings from './pages/Rankings'
 import theme from './theme'
 
 function App() {
@@ -20,6 +21,7 @@ function App() {
               <Route index element={<Dashboard />} />
               <Route path="candidates" element={<Candidates />} />
               <Route path="jobs" element={<Jobs />} />
+              <Route path="rankings" element={<Rankings />} />
             </Route>
           </Routes>
         </Router>

@@ -11,6 +11,7 @@ import {
   Dashboard as DashboardIcon,
   People as PeopleIcon,
   Work as WorkIcon,
+  Leaderboard as LeaderboardIcon,
 } from '@mui/icons-material'
 
 const drawerWidth = 240
@@ -19,6 +20,7 @@ const menuItems = [
   { text: 'Dashboard', icon: <DashboardIcon />, path: '/' },
   { text: 'Candidates', icon: <PeopleIcon />, path: '/candidates' },
   { text: 'Jobs', icon: <WorkIcon />, path: '/jobs' },
+  { text: 'Rankings', icon: <LeaderboardIcon />, path: '/rankings' },
 ]
 
 export default function Sidebar() {
